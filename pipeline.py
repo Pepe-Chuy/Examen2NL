@@ -571,3 +571,349 @@ def time_series_forecasting(train_data, val_data, test_data, n_steps=24, forecas
         'mse': mse,
         'mae': mae
     }
+
+
+
+###############################
+import optuna
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, Conv1D, MaxPooling1D, Flatten, LSTM, Bidirectional, TimeDistributed, GlobalAveragePooling1D
+from tensorflow.keras.optimizers import Adam, RMSprop, SGD
+from sklearn.metrics import mean_absolute_error
+
+def prepare_data_for_optimization(train_data, val_data, n_steps, model_type='mlp'):
+    """
+    Prepare data for model optimization by converting to NumPy and reshaping
+    
+    Args:
+    - train_data: Training data (Pandas Series or NumPy array)
+    - val_data: Validation data (Pandas Series or NumPy array)
+    - n_steps: Number of time steps
+    - model_type: Type of model to prepare data for
+    
+    Returns:
+    - Processed training and validation data
+    """
+    # Convert to NumPy if Pandas Series
+    train_data = np.array(train_data) if isinstance(train_data, pd.Series) else train_data
+    val_data = np.array(val_data) if isinstance(val_data, pd.Series) else val_data
+    
+    # Scale the data
+    scaler = MinMaxScaler()
+    train_data_scaled = scaler.fit_transform(train_data.reshape(-1, 1)).flatten()
+    val_data_scaled = scaler.transform(val_data.reshape(-1, 1)).flatten()
+    
+    # Prepare sequences
+    def create_sequences(data, n_steps):
+        X, y = [], []
+        for i in range(len(data) - n_steps):
+            X.append(data[i:i + n_steps])
+            y.append(data[i + n_steps])
+        return np.array(X), np.array(y)
+    
+    # Create sequences based on model type
+    if model_type == 'mlp':
+        train_X, train_y = create_sequences(train_data_scaled, n_steps)
+        val_X, val_y = create_sequences(val_data_scaled, n_steps)
+        
+        # Reshape for MLP
+        train_X = train_X.reshape((train_X.shape[0], -1))
+        val_X = val_X.reshape((val_X.shape[0], -1))
+    else:
+        train_X, train_y = create_sequences(train_data_scaled, n_steps)
+        val_X, val_y = create_sequences(val_data_scaled, n_steps)
+        
+        # Reshape for CNN, LSTM, CNN-LSTM
+        train_X = train_X.reshape((train_X.shape[0], n_steps, 1))
+        val_X = val_X.reshape((val_X.shape[0], n_steps, 1))
+    
+    return train_X, train_y, val_X, val_y, scaler
+
+def create_optuna_model(trial, input_shape, model_type='mlp'):
+
+    # Select optimizer
+    optimizer_name = trial.suggest_categorical('optimizer', ['adam', 'rmsprop', 'sgd'])
+    learning_rate = trial.suggest_loguniform('learning_rate', 1e-4, 1e-2)
+    
+    if optimizer_name == 'adam':
+        optimizer = Adam(learning_rate=learning_rate)
+    elif optimizer_name == 'rmsprop':
+        optimizer = RMSprop(learning_rate=learning_rate)
+    else:
+        optimizer = SGD(learning_rate=learning_rate)
+    
+    # Select activation function
+    activation = trial.suggest_categorical('activation', ['relu', 'elu', 'tanh'])
+    
+    if model_type == 'mlp':
+        # Hyperparameters for MLP
+        n_layers = trial.suggest_int('n_layers', 2, 5)
+        layers = []
+        
+        # Input layer
+        in_neurons = trial.suggest_int('neurons_0', 32, 256)
+        layers.append(Dense(in_neurons, activation=activation, input_shape=input_shape))
+        
+        # Hidden layers
+        for i in range(1, n_layers):
+            neurons = trial.suggest_int(f'neurons_{i}', 16, 128)
+            dropout_rate = trial.suggest_float(f'dropout_{i}', 0.0, 0.5)
+            
+            layers.append(Dense(neurons, activation=activation))
+            if dropout_rate > 0:
+                layers.append(Dropout(dropout_rate))
+        
+        # Output layer
+        layers.append(Dense(1))
+        
+        model = Sequential(layers)
+    
+    elif model_type == 'cnn':
+        # Hyperparameters for CNN
+        n_conv_layers = trial.suggest_int('n_conv_layers', 1, 3)
+        layers = []
+        
+        # First convolutional layer
+        first_filters = trial.suggest_int('first_filters', 32, 128)
+        first_kernel = trial.suggest_int('first_kernel', 2, 5)
+        layers.append(Conv1D(first_filters, first_kernel, activation=activation, input_shape=input_shape))
+        
+        # Additional convolutional layers
+        for i in range(1, n_conv_layers):
+            filters = trial.suggest_int(f'filters_{i}', 32, 256)
+            kernel = trial.suggest_int(f'kernel_{i}', 2, 5)
+            layers.append(Conv1D(filters, kernel, activation=activation))
+            
+            # Optional pooling
+            if trial.suggest_categorical(f'add_pooling_{i}', [True, False]):
+                layers.append(MaxPooling1D(2))
+        
+        layers.append(GlobalAveragePooling1D())
+        
+        # Dense layers
+        n_dense_layers = trial.suggest_int('n_dense_layers', 1, 3)
+        for i in range(n_dense_layers):
+            neurons = trial.suggest_int(f'dense_neurons_{i}', 16, 128)
+            dropout_rate = trial.suggest_float(f'dense_dropout_{i}', 0.0, 0.5)
+            
+            layers.append(Dense(neurons, activation=activation))
+            if dropout_rate > 0:
+                layers.append(Dropout(dropout_rate))
+        
+        layers.append(Dense(1))
+        
+        model = Sequential(layers)
+    
+    elif model_type == 'lstm':
+        # Hyperparameters for LSTM
+        n_lstm_layers = trial.suggest_int('n_lstm_layers', 1, 3)
+        layers = []
+        
+        # First LSTM layer
+        first_units = trial.suggest_int('first_lstm_units', 32, 256)
+        is_bidirectional = trial.suggest_categorical('is_bidirectional', [True, False])
+        
+        if is_bidirectional:
+            layers.append(Bidirectional(LSTM(first_units, activation=activation, return_sequences=n_lstm_layers > 1), 
+                                         input_shape=input_shape))
+        else:
+            layers.append(LSTM(first_units, activation=activation, 
+                               return_sequences=n_lstm_layers > 1, 
+                               input_shape=input_shape))
+        
+        # Additional LSTM layers
+        for i in range(1, n_lstm_layers):
+            units = trial.suggest_int(f'lstm_units_{i}', 32, 256)
+            dropout_rate = trial.suggest_float(f'lstm_dropout_{i}', 0.0, 0.5)
+            
+            if is_bidirectional:
+                layers.append(Bidirectional(LSTM(units, activation=activation, 
+                                                 return_sequences=(i < n_lstm_layers - 1))))
+            else:
+                layers.append(LSTM(units, activation=activation, 
+                                   return_sequences=(i < n_lstm_layers - 1)))
+            
+            if dropout_rate > 0:
+                layers.append(Dropout(dropout_rate))
+        
+        # Dense layers
+        n_dense_layers = trial.suggest_int('n_dense_layers', 1, 3)
+        for i in range(n_dense_layers):
+            neurons = trial.suggest_int(f'dense_neurons_{i}', 16, 128)
+            layers.append(Dense(neurons, activation=activation))
+        
+        layers.append(Dense(1))
+        
+        model = Sequential(layers)
+    
+    elif model_type == 'cnnlstm':
+        # Hyperparameters for CNN-LSTM
+        n_conv_layers = trial.suggest_int('n_conv_layers', 1, 3)
+        n_lstm_layers = trial.suggest_int('n_lstm_layers', 1, 3)
+        layers = []
+        
+        # Convolutional layers
+        first_filters = trial.suggest_int('first_filters', 32, 128)
+        first_kernel = trial.suggest_int('first_kernel', 2, 5)
+        layers.append(Conv1D(first_filters, first_kernel, activation=activation, input_shape=input_shape))
+        
+        for i in range(1, n_conv_layers):
+            filters = trial.suggest_int(f'filters_{i}', 32, 256)
+            kernel = trial.suggest_int(f'kernel_{i}', 2, 5)
+            layers.append(Conv1D(filters, kernel, activation=activation))
+            
+            if trial.suggest_categorical(f'add_pooling_{i}', [True, False]):
+                layers.append(MaxPooling1D(2))
+        
+        # LSTM layers
+        first_lstm_units = trial.suggest_int('first_lstm_units', 32, 256)
+        is_bidirectional = trial.suggest_categorical('is_bidirectional', [True, False])
+        
+        layers.append(TimeDistributed(Dense(first_lstm_units // 2, activation=activation)))
+        
+        if is_bidirectional:
+            layers.append(Bidirectional(LSTM(first_lstm_units, activation=activation, 
+                                              return_sequences=n_lstm_layers > 1)))
+        else:
+            layers.append(LSTM(first_lstm_units, activation=activation, 
+                                return_sequences=n_lstm_layers > 1))
+        
+        # Additional LSTM layers
+        for i in range(1, n_lstm_layers):
+            units = trial.suggest_int(f'lstm_units_{i}', 32, 256)
+            dropout_rate = trial.suggest_float(f'lstm_dropout_{i}', 0.0, 0.5)
+            
+            if is_bidirectional:
+                layers.append(Bidirectional(LSTM(units, activation=activation, 
+                                                 return_sequences=(i < n_lstm_layers - 1))))
+            else:
+                layers.append(LSTM(units, activation=activation, 
+                                   return_sequences=(i < n_lstm_layers - 1)))
+            
+            if dropout_rate > 0:
+                layers.append(Dropout(dropout_rate))
+        
+        # Dense layers
+        n_dense_layers = trial.suggest_int('n_dense_layers', 1, 3)
+        for i in range(n_dense_layers):
+            neurons = trial.suggest_int(f'dense_neurons_{i}', 16, 128)
+            layers.append(Dense(neurons, activation=activation))
+        
+        layers.append(Dense(1))
+        
+        model = Sequential(layers)
+    
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
+    
+    # Compile the model
+    model.compile(
+        optimizer=optimizer,
+        loss='mean_squared_error',
+        metrics=['mae']
+    )
+    
+    return model
+
+
+def objective(trial, train_X, train_y, val_X, val_y, n_steps, model_type='mlp'):
+    """
+    Objective function for Optuna optimization
+    
+    Args:
+    - trial: Optuna trial object
+    - train_X: Training input data
+    - train_y: Training target data
+    - val_X: Validation input data
+    - val_y: Validation target data
+    - n_steps: Number of time steps
+    - model_type: Type of model to optimize
+    
+    Returns:
+    - Mean Absolute Error on validation set
+    """
+    # Determine input shape based on model type
+    if model_type == 'mlp':
+        input_shape = (n_steps * 1,)
+    else:
+        input_shape = (n_steps, 1)
+    
+    # Create and train the model
+    model = create_optuna_model(trial, input_shape, model_type)
+    
+    # Early stopping
+    early_stop = tf.keras.callbacks.EarlyStopping(
+        monitor='val_loss', 
+        patience=20, 
+        restore_best_weights=True
+    )
+    
+    # Train the model
+    history = model.fit(
+        train_X, train_y,
+        validation_data=(val_X, val_y),
+        epochs=100,
+        batch_size=32,
+        verbose=0,
+        callbacks=[early_stop]
+    )
+    
+    # Return the best validation MAE
+    return min(history.history['val_mae'])
+def optimize_model(train_data, val_data, n_steps, model_type='mlp', n_trials=100):
+    """
+    Perform Optuna hyperparameter optimization
+    
+    Args:
+    - train_data: Training data
+    - val_data: Validation data
+    - n_steps: Number of time steps
+    - model_type: Type of model to optimize
+    - n_trials: Number of optimization trials
+    
+    Returns:
+    - Best model parameters and study
+    """
+    # Prepare data for optimization
+    train_X, train_y, val_X, val_y, scaler = prepare_data_for_optimization(
+        train_data, val_data, n_steps, model_type
+    )
+    
+    # Create a study object and optimize the objective function
+    study = optuna.create_study(direction='minimize')
+    study.optimize(
+        lambda trial: objective(trial, train_X, train_y, val_X, val_y, n_steps, model_type), 
+        n_trials=n_trials
+    )
+    
+    # Print best trial information
+    print(f"Best {model_type.upper()} Model Optimization Results:")
+    print(f"  Number of trials: {len(study.trials)}")
+    print(f"  Best trial value (MAE): {study.best_value}")
+    print("  Best hyperparameters:")
+    for key, value in study.best_params.items():
+        print(f"    {key}: {value}")
+    
+    # Create the best model with optimal hyperparameters
+    best_model = create_optuna_model(
+        study.best_trial,  # Use the best trial directly
+        (n_steps * 1,) if model_type == 'mlp' else (n_steps, 1), 
+        model_type
+    )
+    
+    # Optionally, retrain the best model on full train+val data
+    best_model.fit(
+        train_X, train_y,
+        epochs=100,
+        verbose=0
+    )
+    
+    return {
+        'best_model': best_model,
+        'best_params': study.best_params,
+        'study': study,
+        'scaler': scaler,
+    }
