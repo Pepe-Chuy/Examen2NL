@@ -863,29 +863,58 @@ def objective(trial, train_X, train_y, val_X, val_y, n_steps, model_type='mlp'):
     
     # Return the best validation MAE
     return min(history.history['val_mae'])
-def optimize_model(train_data, val_data, n_steps, model_type='mlp', n_trials=100):
+def optimize_model(train_data, val_data, test_data, n_steps=24, model_type='mlp', n_trials=100, forecast_horizon=48):
     """
-    Perform Optuna hyperparameter optimization
+    Perform Optuna hyperparameter optimization and forecast
     
     Args:
     - train_data: Training data
     - val_data: Validation data
+    - test_data: Test data
     - n_steps: Number of time steps
     - model_type: Type of model to optimize
     - n_trials: Number of optimization trials
+    - forecast_horizon: Number of time steps to forecast
     
     Returns:
-    - Best model parameters and study
+    - Comprehensive optimization and forecasting results
     """
+    # Ensure test_data is long enough
+    if len(test_data) <= n_steps:
+        raise ValueError(f"Test data must be longer than {n_steps} time steps. Current length: {len(test_data)}")
+    
     # Prepare data for optimization
     train_X, train_y, val_X, val_y, scaler = prepare_data_for_optimization(
         train_data, val_data, n_steps, model_type
     )
     
+    # Test data preparation
+    test_data_array = np.array(test_data)
+    test_data_scaled = scaler.transform(test_data_array.reshape(-1, 1)).flatten()
+    
+    # Create test sequences
+    test_X, test_y = [], []
+    for i in range(len(test_data_scaled) - n_steps):
+        test_X.append(test_data_scaled[i:i + n_steps])
+        test_y.append(test_data_scaled[i + n_steps])
+    
+    test_X = np.array(test_X)
+    test_y = np.array(test_y)
+    
+    # Prepare data for the specific model type
+    if model_type == 'mlp':
+        train_X_model = train_X.reshape((train_X.shape[0], -1))
+        val_X_model = val_X.reshape((val_X.shape[0], -1))
+        test_X_model = test_X.reshape((test_X.shape[0], -1))
+    else:
+        train_X_model = train_X.reshape((train_X.shape[0], n_steps, 1))
+        val_X_model = val_X.reshape((val_X.shape[0], n_steps, 1))
+        test_X_model = test_X.reshape((test_X.shape[0], n_steps, 1))
+    
     # Create a study object and optimize the objective function
     study = optuna.create_study(direction='minimize')
     study.optimize(
-        lambda trial: objective(trial, train_X, train_y, val_X, val_y, n_steps, model_type), 
+        lambda trial: objective(trial, train_X_model, train_y, val_X_model, val_y, n_steps, model_type), 
         n_trials=n_trials
     )
     
@@ -897,23 +926,168 @@ def optimize_model(train_data, val_data, n_steps, model_type='mlp', n_trials=100
     for key, value in study.best_params.items():
         print(f"    {key}: {value}")
     
+    # Determine input shape based on model type
+    input_shape = (n_steps * 1,) if model_type == 'mlp' else (n_steps, 1)
+    
     # Create the best model with optimal hyperparameters
     best_model = create_optuna_model(
         study.best_trial,  # Use the best trial directly
-        (n_steps * 1,) if model_type == 'mlp' else (n_steps, 1), 
+        input_shape, 
         model_type
     )
     
-    # Optionally, retrain the best model on full train+val data
-    best_model.fit(
-        train_X, train_y,
-        epochs=100,
-        verbose=0
+    # Combine train and validation data
+    full_train_X = np.concatenate([train_X_model, val_X_model], axis=0)
+    full_train_y = np.concatenate([train_y, val_y], axis=0)
+    
+    # Early stopping
+    early_stop = tf.keras.callbacks.EarlyStopping(
+        monitor='val_loss', 
+        patience=20, 
+        restore_best_weights=True
     )
+    
+    # Train on full data
+    best_model.fit(
+        full_train_X, full_train_y,
+        epochs=100,
+        verbose=0,
+        validation_split=0.2,
+        callbacks=[early_stop]
+    )
+    
+    # Predictions on test data
+    test_predictions = best_model.predict(test_X_model)
+    test_predictions_original = scaler.inverse_transform(test_predictions)
+    test_true_original = scaler.inverse_transform(test_y.reshape(-1, 1))
+    
+    # Calculate performance metrics
+    mae = mean_absolute_error(test_true_original, test_predictions_original)
+    mse = mean_squared_error(test_true_original, test_predictions_original)
+    
+    # Forecast generation function
+    def generate_forecast(model, initial_sequence, forecast_horizon):
+        forecast = []
+        current_sequence = initial_sequence
+        
+        for _ in range(forecast_horizon):
+            next_prediction = model.predict(current_sequence)
+            next_prediction_original = scaler.inverse_transform(next_prediction)
+            forecast.append(next_prediction_original[0][0])
+            
+            # Update sequence
+            if model_type == 'mlp':
+                current_sequence = np.roll(current_sequence, -1)
+                current_sequence[0, -1] = next_prediction[0, 0] 
+            else:
+                current_sequence = np.roll(current_sequence, -1, axis=1)
+                current_sequence[0, -1, 0] = next_prediction[0, 0]
+        
+        return np.array(forecast)
+    
+    # Use the last sequence of test data as initial sequence for forecasting
+    initial_forecast_sequence = test_X_model[-1].reshape(1, *test_X_model[-1].shape)
+    forecast = generate_forecast(best_model, initial_forecast_sequence, forecast_horizon)
+    
+    # Plotting
+    plt.figure(figsize=(15, 7))
+    
+    # Plot training data
+    plt.plot(range(len(train_data)), train_data, color='green', label='Training Data')
+    
+    # Plot validation data
+    train_end = len(train_data)
+    val_end = train_end + len(val_data)
+    plt.plot(range(train_end, val_end), val_data, color='orange', label='Validation Data')
+    
+    # Plot test data
+    test_start = val_end
+    test_end = test_start + len(test_data)
+    plt.plot(range(test_start, test_end), test_data, color='red', label='Test Data')
+    
+    # Plot forecast
+    forecast_start = test_end
+    forecast_end = forecast_start + len(forecast)
+    plt.plot(range(test_end, forecast_end), forecast, color='blue', label='Forecast')
+    
+    plt.title(f'Time Series Forecast - {model_type.upper()} Optimized Model')
+    plt.xlabel('Time Steps')
+    plt.ylabel('Value')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+    
+    # Print prediction comparison
+    print("\nTest Data Prediction Analysis:")
+    plt.figure(figsize=(15, 6))
+    plt.plot(test_true_original, label='Actual Test Data', color='red')
+    plt.plot(test_predictions_original, label='Predicted Test Data', color='blue')
+    plt.title(f'{model_type.upper()} Model: Actual vs Predicted Test Data')
+    plt.xlabel('Time Steps')
+    plt.ylabel('Value')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+    
+    # Performance metrics
+    print(f"\nModel Performance Metrics:")
+    print(f"Mean Absolute Error (MAE): {mae}")
+    print(f"Mean Squared Error (MSE): {mse}")
     
     return {
         'best_model': best_model,
         'best_params': study.best_params,
         'study': study,
         'scaler': scaler,
+        'forecast': forecast,
+        'mae': mae,
+        'mse': mse,
+        'test_predictions': test_predictions_original,
+        'test_true': test_true_original
     }
+
+
+###########################################################################
+
+def plot_model_predictions(models_info, train_data, val_data, test_data, forecast_horizon=48):
+    """
+    Plots the predictions of the given models on the train, validation, and test datasets.
+
+    Args:
+    - models_info: List of tuples containing (model, model_type, forecast) for each model.
+    - train_data: Training data (Pandas Series).
+    - val_data: Validation data (Pandas Series).
+    - test_data: Test data (Pandas Series).
+    - forecast_horizon: Number of time steps to forecast.
+    """
+    plt.figure(figsize=(15, 7))
+
+    # Plot training data
+    plt.plot(range(len(train_data)), train_data, color='green', label='Training Data')
+
+    # Plot validation data
+    train_end = len(train_data)
+    val_end = train_end + len(val_data)
+    plt.plot(range(train_end, val_end), val_data, color='orange', label='Validation Data')
+
+    # Plot test data
+    test_start = val_end
+    test_end = test_start + len(test_data)
+    plt.plot(range(test_start, test_end), test_data, color='red', label='Test Data')
+
+    # Plot forecasts for each model
+    for model_info in models_info:
+        model, model_type, forecast = model_info
+        forecast_start = test_end
+        forecast_end = forecast_start + len(forecast)
+        plt.plot(range(forecast_start, forecast_end), forecast, label=f'{model_type} Forecast')
+
+    plt.title('Model Predictions Comparison')
+    plt.xlabel('Time Steps')
+    plt.ylabel('Value')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
