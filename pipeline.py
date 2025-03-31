@@ -891,7 +891,7 @@ def objective(trial, train_X, train_y, val_X, val_y, n_steps, model_type='mlp'):
     
     # Train the model
     history = model.fit(
-        train_X, train_y,
+        train_X, train_y,32
         validation_data=(val_X, val_y),
         epochs=100,
         batch_size=32,
