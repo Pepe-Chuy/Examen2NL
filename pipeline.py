@@ -25,7 +25,7 @@ import optuna
 
 '''
 I defined this file as a compilation of static functions, at first I wanted to make it a class, but when I realized 
-it was maybe too late for that So I keeped it as functions, but the point is that I could recreate the process easily 
+it was maybe too late for that So I keeped them as functions, but the point is that I could recreate the process easily 
 doesnt matter the data, and select the better model of all archs, and automatically the best model 
 can be pulled by optuna and optimized it without a lot of code on the ipynb, to keep it clean and reproductible
 '''
@@ -891,7 +891,7 @@ def objective(trial, train_X, train_y, val_X, val_y, n_steps, model_type='mlp'):
     
     # Train the model
     history = model.fit(
-        train_X, train_y,32
+        train_X, train_y,
         validation_data=(val_X, val_y),
         epochs=100,
         batch_size=32,
